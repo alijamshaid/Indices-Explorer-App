@@ -1,0 +1,242 @@
+#App-link : https://my-project-1541410721404.projects.earthengine.app/view/indices-app
+
+var table = ee.FeatureCollection("FAO/GAUL/2025/level2");
+var s2 = ee.ImageCollection("COPERNICUS/S2_HARMONIZED");
+
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var csPlusBands = csPlus.first().bandNames();
+
+// We need to add Cloud Score + bands to each Sentinel-2
+// image in the collection
+// This is done using the linkCollection() function
+var s2WithCs = s2.linkCollection(csPlus, csPlusBands);
+
+// Function to mask pixels with low CS+ QA scores.
+  function maskLowQA(image) {
+    var qaBand = 'cs';
+    var clearThreshold = 0.5;
+    var mask = image.select(qaBand).gte(clearThreshold);
+    return image.updateMask(mask);
+  }
+  
+  
+var countries = table.aggregate_array('GAUL0_NAME').distinct().sort();
+var panel = ui.Panel({style:{
+  width:"400px",
+  backgroundColor:"black",
+  color:"blue",
+}});
+
+var horizantalPanel = ui.Panel({
+    layout:ui.Panel.Layout.Flow("horizontal"),
+    style:{
+      backgroundColor:"black",
+      color:"blue",
+    }
+});
+panel.add(horizantalPanel);
+var secondHorizantalPanel = ui.Panel({
+    layout:ui.Panel.Layout.Flow("horizontal"),
+    style:{
+      backgroundColor:"black",
+      color:"blue",
+    }
+});
+panel.add(secondHorizantalPanel);
+var selectCity = [];
+var correctingCities = function(e){
+  selectCity.evaluate(function(eachCity){
+    citySelector.items().reset(eachCity)
+    citySelector.setDisabled(false);
+  })
+};
+
+var citySelector = ui.Select({
+  placeholder:"City",
+  disabled:true,
+});
+
+var fetchCities = function(){
+  var query = table.
+    filter(ee.Filter.eq("GAUL0_NAME",countrySelector.getValue()))
+  // var onlyAttributes = query.select(["GAUL2_NAME"],null,false);
+    var onlyCity = query.aggregate_array("GAUL2_NAME").sort();
+    selectCity = onlyCity;
+    correctingCities();
+};
+
+var countrySelector = ui.Select({
+  placeholder:"Country",
+  onChange:fetchCities,
+});
+
+var yearSelector = ui.Select({placeholder:"Set the year"});
+var monthSelector = ui.Select({placeholder:"Set the Month"});
+var years= ee.List.sequence(2016,2026);
+var months = ee.List.sequence(1,12);
+
+var namesOfIndices = ee.Dictionary({
+    "NDVI":["B8","B4","ndvi","white","green"],
+    "NDBI":["B8","B12","ndbi","white","red"],
+    "MNDWI":["B3","B11","mndwi","white","blue"],
+    "SAVI":["B4","B8","savi","white","red"],
+    "MSAVI":["B8","B4","msavi","white","orange"],
+});
+
+var calculateIndices = ui.Select({
+  items:["NDVI","NDBI","MNDWI","SAVI","MSAVI"],
+  placeholder:"Select the Indice",
+});
+
+
+var stringYears = years.map(function(year){
+  return ee.Number(year).format('%04d')
+});
+var stringMonths = months.map(function(month){
+  return ee.Number(month).format('%d')
+});
+
+countries.evaluate(function(countrylist){
+  countrySelector.items().reset(countrylist)
+});
+
+stringYears.evaluate(function(yearlist){
+  yearSelector.items().reset(yearlist)
+});
+stringMonths.evaluate(function(monthList){
+  monthSelector.items().reset(monthList)
+})
+var chartPanel = ui.Panel();
+var secondChartPanel = ui.Panel();
+var load = function(e){
+  Map.clear();
+  chartPanel.clear();
+  secondChartPanel.clear();
+  var selectedYear = yearSelector.getValue();
+  var selectedMonth = monthSelector.getValue();
+  var startDate = ee.Date.fromYMD(ee.Number.parse(selectedYear),
+  ee.Number.parse(selectedMonth),1);
+  var endDate = startDate.advance(1,"year");
+  var tableFilter = table.filter(ee.Filter.eq("GAUL2_NAME",citySelector.getValue()));
+  var s2Filter= s2WithCs
+    .filter(ee.Filter.bounds(tableFilter))
+    .filter(ee.Filter.date(startDate, endDate))
+    .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE",15))
+    .map(maskLowQA);
+  
+  var bandsForIndice = namesOfIndices.values([calculateIndices.getValue()]);
+  var furterListIndice = bandsForIndice.get(0);
+  var selectedIndice = ee.List(furterListIndice).get(2);
+  var nameOfIndice = ee.String(selectedIndice);
+  var colorsSelectionForIndices = ee.List(namesOfIndices.get(calculateIndices.getValue()));
+  var colorsSelected = colorsSelectionForIndices.slice(3);
+  var addIndice = function(image){
+    var indice = image.normalizedDifference([ee.List(furterListIndice).get(0),ee.List(furterListIndice).get(1)]).rename(ee.String(selectedIndice));
+    var clippedIndice = indice.clip(tableFilter);
+    return image.addBands(clippedIndice);
+  }
+
+  var indicedImage = s2Filter.map(addIndice);
+  // var compositeIndice = indicedImage.median();
+  // var compsoiteNdvi = compositeIndice.select("ndvi");
+  Map.centerObject(tableFilter);
+  var output = ee.String(calculateIndices.getValue());
+  var indice = indicedImage.select(ee.String(selectedIndice)).first();
+  var classified = (indice.lte(0.2).toInt())
+  .add((indice.gte(0.2).and(indice.lt(0.4))).toInt().multiply(0.2))
+  .add((indice.gte(0.4).and(indice.lt(0.6))).toInt().multiply(0.2))
+  .add((indice.gte(0.6).and(indice.lte(0.7))).toInt().multiply(0.2))
+  .rename('classes');
+
+  var histogram = classified.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: tableFilter,
+  scale: 90,
+  });
+  var chartHistogram = ui.Chart.image.histogram({
+  image: classified,
+  region: tableFilter,
+  scale: 20,             // Match your dataset resolution (e.g., 30m for Landsat)
+  maxBuckets: 64,        // Keeps the bucket limit small since you have few classes
+  minBucketWidth: 1, 
+  maxPixels: 1e9,
+  // CRITICAL: Forces each class integer to have its own bar
+  })
+  .setOptions({
+      title: (output).cat(" Histogram").getInfo(),
+      vAxis: {title: "Pixel Count"},
+      hAxis: {title: "Indice Value", viewWindow: {min: -1, max: 1}},
+    });
+  chartPanel.add(chartHistogram);
+  var visIndice = (indicedImage.select(ee.String(selectedIndice)));
+  Map.addLayer(tableFilter,{},"Area of Interest");
+
+  var colors = colorsSelected.evaluate(function(e){
+    Map.addLayer(visIndice,{min:0,max:0.3,palette:e},
+    calculateIndices.getValue());
+  });
+  Map.onClick(function(coords){
+    secondChartPanel.clear()
+    var point = ee.Geometry.Point([coords.lon, coords.lat]);
+    var chartGeeTwo = ui.Chart.image.series({
+    imageCollection:indicedImage.select(ee.String(selectedIndice)), 
+    region:point,
+    reducer:ee.Reducer.mean(),
+    scale:30})
+  .setOptions({
+      title: (output).cat(" Time Series").getInfo(),
+      vAxis: {title: ee.String(selectedIndice)},
+      hAxis: {title: 'Date', gridlines: {count: 12}},
+      interpolateNulls: true,
+      pointSize: 2,
+      lineWidth: 1,
+    });
+  secondChartPanel.add(chartGeeTwo);
+  });
+  Map.add(titleChartIndice);
+  Map.add(title);
+};
+
+var buttonLoad = ui.Button({
+  label:"submit",
+  onClick:load,
+  style:{color:"red",backgroundColor:"blue"},
+})
+
+var myName = ui.Label({
+  value:"By Muhammad Ali (Visit my Website)",
+  style:{fontSize:"18px",backgroundColor:"black",color:"blue"}, 
+  targetUrl:"https://muhammad-ali-resume.vercel.app/"
+});
+
+var title = ui.Label({
+  value:"Indices Explorer of Your Area of Interest",
+  style:{
+    position:"top-center",
+    fontSize:"24px",
+    backgroundColor:"black",
+    color:"blue",
+  }
+});
+
+var titleChartIndice = ui.Label({
+  value:"click to get Time Series chart",
+  style:{
+    position:"bottom-center",
+    fontSize:"24px",
+    backgroundColor:"black",
+    color:"blue",
+  }
+});
+
+horizantalPanel.add(countrySelector);
+horizantalPanel.add(citySelector);
+secondHorizantalPanel.add(monthSelector);
+secondHorizantalPanel.add(yearSelector);
+panel.add(calculateIndices);
+panel.add(buttonLoad);
+panel.add(chartPanel);
+panel.add(secondChartPanel);
+panel.add(myName);
+Map.add(title);
+ui.root.add(panel);
